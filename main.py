@@ -3,10 +3,11 @@ import io
 import logging
 import os
 import sqlite3
+import re
 from datetime import datetime
 import pytz
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -23,9 +24,28 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     logging.warning("BOT_TOKEN environment variable is not set!")
 
+ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip().isdigit()]
+if not ADMIN_IDS:
+    logging.warning("ADMIN_IDS environment variable is not set! Bot is public.")
+
 # Initialize bot and dispatcher
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
+
+class AdminMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: types.Message, data: dict):
+        if not ADMIN_IDS:
+            # If no admins are set, allow all (or you can block all)
+            return await handler(event, data)
+        
+        if event.from_user.id not in ADMIN_IDS:
+            await event.answer("⛔ У вас нет доступа к этой системе.")
+            return
+            
+        return await handler(event, data)
+
+dp.message.middleware(AdminMiddleware())
 
 # Timezone
 TZ = pytz.timezone('Europe/Moscow')
@@ -115,74 +135,104 @@ class JobForm(StatesGroup):
 # Smart Parser
 def parse_message(text: str):
     """Parses natural Russian text to extract commands and data"""
-    text = text.lower().strip()
-    words = text.split()
+    text_lower = text.lower().strip()
+    words = text_lower.split()
     if not words: return None
     
-    # Inventory: добавить химия 5 / списать химия 2
+    # 1. Inventory: добавить химия 5 / списать химия 2
     if words[0] in ['добавить', 'списать'] and len(words) >= 3:
         try:
-            qty = float(words[-1])
+            qty = float(words[-1].replace(',', '.'))
             item = " ".join(words[1:-1]).capitalize()
             return {"type": "inventory", "action": words[0], "item": item, "qty": qty}
         except ValueError:
             pass
-            
-    # Job: "анна пушкина 10 12000 зарплата 4000"
-    if 'зарплата' in words:
-        z_idx = words.index('зарплата')
-        if z_idx >= 3 and z_idx + 1 < len(words):
-            try:
-                salary = float(words[z_idx + 1])
-                price = float(words[z_idx - 1])
-                employee = words[0].capitalize()
-                client_address = " ".join(words[1:z_idx - 1]).title()
-                return {"type": "job", "employee": employee, "client": client_address, "price": price, "salary": salary}
-            except ValueError:
-                pass
-                
-        # Salary payment: "вася 3000 зарплата"
-        try:
-            amount = next(float(w) for w in words if w.isdigit())
-            employee = next(w.capitalize() for w in words if w != 'зарплата' and not w.isdigit())
-            return {"type": "salary_payment", "employee": employee, "amount": amount, "payment_type": "зарплата"}
-        except StopIteration:
-            pass
-            
-    # Advance payment: "анна 5000 аванс"
-    if 'аванс' in words:
-        try:
-            amount = next(float(w) for w in words if w.isdigit())
-            employee = next(w.capitalize() for w in words if w != 'аванс' and not w.isdigit())
-            return {"type": "salary_payment", "employee": employee, "amount": amount, "payment_type": "аванс"}
-        except StopIteration:
-            pass
 
-    # Income: "клиент 15000" or "доход 15000"
+    # 2. Extract numbers
+    numbers_str = re.findall(r'\b\d+(?:\.\d+)?\b', text_lower.replace(',', '.'))
+    numbers = [float(x) for x in numbers_str]
+    
+    if not numbers:
+        return None # No numbers, can't parse financial data
+        
+    # 3. Income explicitly
     if 'доход' in words or 'клиент' in words:
-        try:
-            amount = next(float(w) for w in words if w.isdigit())
-            source = " ".join([w for w in words if not w.isdigit()]).capitalize()
-            return {"type": "income", "source": source, "amount": amount}
-        except StopIteration:
-            pass
-
-    # Expense: "химия 2000" or "бензин 1500"
-    try:
-        numbers = [float(w) for w in words if w.isdigit()]
-        if len(numbers) == 1:
-            amount = numbers[0]
-            category = " ".join([w for w in words if not w.isdigit()]).capitalize()
-            return {"type": "expense", "category": category, "amount": amount}
-    except Exception:
-        pass
-
-    return None
+        amount = numbers[0]
+        source_words = [w for w in words if 'доход' not in w and 'клиент' not in w and not re.search(r'\d', w)]
+        source = " ".join(source_words).capitalize().strip(' ,.') or "Клиент"
+        return {"type": "income", "source": source, "amount": amount}
+        
+    # 4. Advance explicitly
+    if 'аванс' in words:
+        amount = numbers[0]
+        emp_words = [w for w in words if 'аванс' not in w and not re.search(r'\d', w)]
+        employee = emp_words[0].capitalize().strip(' ,.') if emp_words else "Неизвестно"
+        return {"type": "salary_payment", "employee": employee, "amount": amount, "payment_type": "аванс"}
+        
+    # 5. Job / Expense / Salary
+    employee = words[0].capitalize().strip(' ,.')
+    
+    large_numbers = [n for n in numbers if n >= 100]
+    price = large_numbers[0] if large_numbers else numbers[0]
+    
+    salary = 0
+    if 'зарплата' in words:
+        if len(large_numbers) >= 2:
+            salary = large_numbers[1]
+        else:
+            remaining_numbers = [n for n in numbers if n != price]
+            if remaining_numbers:
+                salary = remaining_numbers[0]
+    
+    address_words = []
+    price_found = False
+    salary_found = False
+    
+    for i, w in enumerate(words):
+        if i == 0: continue # Skip employee
+        if 'зарплата' in w: continue
+        
+        nums_in_word = re.findall(r'\b\d+(?:\.\d+)?\b', w.replace(',', '.'))
+        if nums_in_word:
+            num_val = float(nums_in_word[0])
+            if not price_found and num_val == price:
+                price_found = True
+                clean_w = re.sub(r'\b\d+(?:\.\d+)?\b', '', w.replace(',', '.')).strip(' ,.')
+                if not clean_w:
+                    continue
+            elif salary > 0 and not salary_found and num_val == salary:
+                salary_found = True
+                clean_w = re.sub(r'\b\d+(?:\.\d+)?\b', '', w.replace(',', '.')).strip(' ,.')
+                if not clean_w:
+                    continue
+        
+        address_words.append(w)
+        
+    address = " ".join(address_words).title().strip(' ,.')
+    
+    if address:
+        # Check if it's a job or expense
+        emp_exists = execute_query("SELECT id FROM employees WHERE name LIKE ?", (employee,), fetch=True)
+        job_keywords = ['улица', 'ул', 'дом', 'д', 'кв', 'проспект', 'пр', 'переулок', 'пер', 'тц', 'бц', 'жк', 'квартира', 'офис']
+        
+        # If the address contains job keywords OR the employee is in the DB, it's a job
+        if emp_exists or any(k in text_lower for k in job_keywords):
+            return {"type": "job", "employee": employee, "client": address, "price": price, "salary": salary}
+        else:
+            # Expense with multiple words
+            category = f"{employee} {address}"
+            return {"type": "expense", "category": category, "amount": price}
+    else:
+        emp_exists = execute_query("SELECT id FROM employees WHERE name LIKE ?", (employee,), fetch=True)
+        if emp_exists or 'зарплата' in words:
+            return {"type": "salary_payment", "employee": employee, "amount": price, "payment_type": 'зарплата'}
+        else:
+            return {"type": "expense", "category": employee, "amount": price}
 
 async def process_text_message(message: types.Message, text: str):
     parsed = parse_message(text)
     if not parsed:
-        await message.answer("Не удалось распознать команду. Попробуйте переформулировать.")
+        await message.answer("❌ Не удалось распознать команду. Убедитесь, что в сообщении есть сумма (число).")
         return
         
     now = get_now()
@@ -193,11 +243,12 @@ async def process_text_message(message: types.Message, text: str):
             "INSERT INTO jobs (employee, client, address, price, employee_salary, profit, date, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (parsed["employee"], parsed["client"], parsed["client"], parsed["price"], parsed["salary"], profit, now, now)
         )
+        salary_text = f"{parsed['salary']}" if parsed['salary'] > 0 else "0 (не указана)"
         await message.answer(f"✅ **Заявка сохранена!**\n\n"
                              f"Сотрудник: {parsed['employee']}\n"
-                             f"Клиент/Адрес: {parsed['client']}\n"
+                             f"Адрес/Клиент: {parsed['client']}\n"
                              f"Цена: {parsed['price']}\n"
-                             f"Зарплата: {parsed['salary']}\n"
+                             f"Зарплата: {salary_text}\n"
                              f"Прибыль: {profit}", parse_mode="Markdown")
                              
     elif parsed["type"] == "salary_payment":
