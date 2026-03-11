@@ -1,18 +1,17 @@
 import asyncio
-import io
 import logging
 import os
-import sqlite3
-import re
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
+import io
 
-from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
-from aiogram.filters import CommandStart, Command
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
+# Voice recognition
 import speech_recognition as sr
 from pydub import AudioSegment
 
@@ -22,601 +21,442 @@ logging.basicConfig(level=logging.INFO)
 # Environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    logging.warning("BOT_TOKEN environment variable is not set!")
-
-ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip().isdigit()]
-if not ADMIN_IDS:
-    logging.warning("ADMIN_IDS environment variable is not set! Bot is public.")
+    logging.warning("BOT_TOKEN is not set. Please set it in your environment variables.")
+    # Fallback for testing purposes if needed, but should raise error in production
+    # raise ValueError("No BOT_TOKEN provided")
 
 # Initialize bot and dispatcher
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
-
-class AdminMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event: types.Message, data: dict):
-        if not ADMIN_IDS:
-            # If no admins are set, allow all (or you can block all)
-            return await handler(event, data)
-        
-        if event.from_user.id not in ADMIN_IDS:
-            await event.answer("⛔ У вас нет доступа к этой системе.")
-            return
-            
-        return await handler(event, data)
-
-dp.message.middleware(AdminMiddleware())
+router = Router()
+dp.include_router(router)
 
 # Timezone
 TZ = pytz.timezone('Europe/Moscow')
 
-def get_now():
-    """Returns current date in DD.MM.YYYY format"""
-    return datetime.now(TZ).strftime("%d.%m.%Y")
-
-# Database setup
-DB_NAME = "cleaning_erp.db"
-
-def execute_query(query, params=(), fetch=False, fetchall=False):
-    """Helper function to execute database queries"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(query, params)
-    if fetch:
-        res = cursor.fetchone()
-    elif fetchall:
-        res = cursor.fetchall()
-    else:
-        conn.commit()
-        res = None
-    conn.close()
-    return res
-
-def init_db():
-    """Initialize database tables"""
-    queries = [
-        '''CREATE TABLE IF NOT EXISTS employees (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT, phone TEXT, role TEXT, created_at TEXT
-        )''',
-        '''CREATE TABLE IF NOT EXISTS clients (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT, phone TEXT, address TEXT, created_at TEXT
-        )''',
-        '''CREATE TABLE IF NOT EXISTS jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee TEXT, client TEXT, address TEXT,
-            price REAL, employee_salary REAL, profit REAL,
-            date TEXT, created_at TEXT
-        )''',
-        '''CREATE TABLE IF NOT EXISTS salary_payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee TEXT, amount REAL, type TEXT,
-            comment TEXT, date TEXT, created_at TEXT
-        )''',
-        '''CREATE TABLE IF NOT EXISTS expenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT, amount REAL, comment TEXT,
-            date TEXT, created_at TEXT
-        )''',
-        '''CREATE TABLE IF NOT EXISTS income (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source TEXT, amount REAL, comment TEXT,
-            date TEXT, created_at TEXT
-        )''',
-        '''CREATE TABLE IF NOT EXISTS inventory (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item_name TEXT, quantity REAL, price REAL, created_at TEXT
-        )'''
-    ]
-    for q in queries:
-        execute_query(q)
+# --- DATABASE SETUP ---
+from database import init_db, get_db_connection
 
 init_db()
 
-# Keyboards
-menu_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="📊 Панель"), KeyboardButton(text="🧹 Заявки"), KeyboardButton(text="👥 Сотрудники")],
-        [KeyboardButton(text="💰 Зарплаты"), KeyboardButton(text="📉 Расходы"), KeyboardButton(text="📈 Доходы")],
-        [KeyboardButton(text="📦 Склад"), KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📑 Отчет")]
-    ],
-    resize_keyboard=True
-)
+# --- KEYBOARDS ---
+def main_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Панель", callback_data="menu_panel"), InlineKeyboardButton(text="🧹 Заявки", callback_data="menu_jobs")],
+        [InlineKeyboardButton(text="👥 Сотрудники", callback_data="menu_employees"), InlineKeyboardButton(text="💰 Зарплаты", callback_data="menu_salaries")],
+        [InlineKeyboardButton(text="📉 Расходы", callback_data="menu_expenses"), InlineKeyboardButton(text="📈 Доходы", callback_data="menu_income")],
+        [InlineKeyboardButton(text="📦 Склад", callback_data="menu_inventory"), InlineKeyboardButton(text="📑 Отчет", callback_data="menu_reports")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="menu_statistics")]
+    ])
 
-# FSM States for Job Creation
-class JobForm(StatesGroup):
-    employee = State()
-    client = State()
+def back_to_main_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_main")]
+    ])
+
+def jobs_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить заявку", callback_data="job_add")],
+        [InlineKeyboardButton(text="📋 Просмотр заявок", callback_data="job_view")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+    ])
+
+def employees_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить сотрудника", callback_data="emp_add")],
+        [InlineKeyboardButton(text="📋 Просмотр списка", callback_data="emp_view")],
+        [InlineKeyboardButton(text="📈 Статистика сотрудника", callback_data="emp_stats")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+    ])
+
+def finance_menu_kb(type_name):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить", callback_data=f"{type_name}_add")],
+        [InlineKeyboardButton(text="📋 Просмотр", callback_data=f"{type_name}_view")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+    ])
+
+def select_employee_kb(prefix="sel_emp_"):
+    conn = get_db_connection()
+    employees = conn.execute("SELECT id, name FROM employees").fetchall()
+    conn.close()
+    kb = []
+    for emp in employees:
+        kb.append([InlineKeyboardButton(text=emp['name'], callback_data=f"{prefix}{emp['id']}")])
+    kb.append([InlineKeyboardButton(text="🔙 Отмена", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def date_kb(prefix="date_"):
+    today = datetime.now(TZ).strftime("%d.%m.%Y")
+    tomorrow = (datetime.now(TZ) + timedelta(days=1)).strftime("%d.%m.%Y")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Сегодня ({today})", callback_data=f"{prefix}{today}")],
+        [InlineKeyboardButton(text=f"Завтра ({tomorrow})", callback_data=f"{prefix}{tomorrow}")],
+        [InlineKeyboardButton(text="Ввести вручную", callback_data=f"{prefix}manual")]
+    ])
+
+# --- STATES ---
+class JobFSM(StatesGroup):
+    employee_id = State()
+    client_name = State()
     address = State()
     price = State()
-    salary = State()
+    employee_salary = State()
+    date = State()
 
-# Smart Parser
-def parse_message(text: str):
-    """Parses natural Russian text to extract commands and data"""
-    text_lower = text.lower().strip()
-    words = text_lower.split()
-    if not words: return None
-    
-    # 1. Inventory: добавить химия 5 / списать химия 2
-    if words[0] in ['добавить', 'списать'] and len(words) >= 3:
-        try:
-            qty = float(words[-1].replace(',', '.'))
-            item = " ".join(words[1:-1]).capitalize()
-            return {"type": "inventory", "action": words[0], "item": item, "qty": qty}
-        except ValueError:
-            pass
+class EmployeeFSM(StatesGroup):
+    name = State()
+    phone = State()
+    role = State()
 
-    # 2. Extract numbers
-    numbers_str = re.findall(r'\b\d+(?:\.\d+)?\b', text_lower.replace(',', '.'))
-    numbers = [float(x) for x in numbers_str]
-    
-    if not numbers:
-        return None # No numbers, can't parse financial data
-        
-    # 3. Income explicitly
-    if 'доход' in words or 'клиент' in words:
-        amount = numbers[0]
-        source_words = [w for w in words if 'доход' not in w and 'клиент' not in w and not re.search(r'\d', w)]
-        source = " ".join(source_words).capitalize().strip(' ,.') or "Клиент"
-        return {"type": "income", "source": source, "amount": amount}
-        
-    # 4. Advance explicitly
-    if 'аванс' in words:
-        amount = numbers[0]
-        emp_words = [w for w in words if 'аванс' not in w and not re.search(r'\d', w)]
-        employee = emp_words[0].capitalize().strip(' ,.') if emp_words else "Неизвестно"
-        return {"type": "salary_payment", "employee": employee, "amount": amount, "payment_type": "аванс"}
-        
-    # 5. Job / Expense / Salary
-    employee = words[0].capitalize().strip(' ,.')
-    
-    large_numbers = [n for n in numbers if n >= 100]
-    price = large_numbers[0] if large_numbers else numbers[0]
-    
-    salary = 0
-    if 'зарплата' in words:
-        if len(large_numbers) >= 2:
-            salary = large_numbers[1]
-        else:
-            remaining_numbers = [n for n in numbers if n != price]
-            if remaining_numbers:
-                salary = remaining_numbers[0]
-    
-    address_words = []
-    price_found = False
-    salary_found = False
-    
-    for i, w in enumerate(words):
-        if i == 0: continue # Skip employee
-        if 'зарплата' in w: continue
-        
-        nums_in_word = re.findall(r'\b\d+(?:\.\d+)?\b', w.replace(',', '.'))
-        if nums_in_word:
-            num_val = float(nums_in_word[0])
-            if not price_found and num_val == price:
-                price_found = True
-                clean_w = re.sub(r'\b\d+(?:\.\d+)?\b', '', w.replace(',', '.')).strip(' ,.')
-                if not clean_w:
-                    continue
-            elif salary > 0 and not salary_found and num_val == salary:
-                salary_found = True
-                clean_w = re.sub(r'\b\d+(?:\.\d+)?\b', '', w.replace(',', '.')).strip(' ,.')
-                if not clean_w:
-                    continue
-        
-        address_words.append(w)
-        
-    address = " ".join(address_words).title().strip(' ,.')
-    
-    if address:
-        # Check if it's a job or expense
-        emp_exists = execute_query("SELECT id FROM employees WHERE name LIKE ?", (employee,), fetch=True)
-        job_keywords = ['улица', 'ул', 'дом', 'д', 'кв', 'проспект', 'пр', 'переулок', 'пер', 'тц', 'бц', 'жк', 'квартира', 'офис']
-        
-        # If the address contains job keywords OR the employee is in the DB, it's a job
-        if emp_exists or any(k in text_lower for k in job_keywords):
-            return {"type": "job", "employee": employee, "client": address, "price": price, "salary": salary}
-        else:
-            # Expense with multiple words
-            category = f"{employee} {address}"
-            return {"type": "expense", "category": category, "amount": price}
-    else:
-        emp_exists = execute_query("SELECT id FROM employees WHERE name LIKE ?", (employee,), fetch=True)
-        if emp_exists or 'зарплата' in words:
-            return {"type": "salary_payment", "employee": employee, "amount": price, "payment_type": 'зарплата'}
-        else:
-            return {"type": "expense", "category": employee, "amount": price}
+class ExpenseFSM(StatesGroup):
+    category = State()
+    amount = State()
+    comment = State()
 
-async def process_text_message(message: types.Message, text: str):
-    parsed = parse_message(text)
-    if not parsed:
-        await message.answer("❌ Не удалось распознать команду. Убедитесь, что в сообщении есть сумма (число).")
-        return
-        
-    now = get_now()
+class IncomeFSM(StatesGroup):
+    source = State()
+    amount = State()
+    comment = State()
+
+# --- HANDLERS: MAIN MENU ---
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("👋 Добро пожаловать в систему управления клининговой компанией!\nВыберите раздел:", reply_markup=main_menu_kb())
+
+@router.callback_query(F.data == "back_to_main")
+async def back_to_main(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("📊 Главное меню:", reply_markup=main_menu_kb())
+
+@router.callback_query(F.data == "menu_panel")
+async def menu_panel(callback: CallbackQuery):
+    conn = get_db_connection()
+    today = datetime.now(TZ).strftime("%d.%m.%Y")
+    jobs_today = conn.execute("SELECT COUNT(*) FROM jobs WHERE date = ?", (today,)).fetchone()[0]
+    profit_today = conn.execute("SELECT SUM(profit) FROM jobs WHERE date = ?", (today,)).fetchone()[0] or 0
+    conn.close()
     
-    if parsed["type"] == "job":
-        profit = parsed["price"] - parsed["salary"]
-        execute_query(
-            "INSERT INTO jobs (employee, client, address, price, employee_salary, profit, date, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (parsed["employee"], parsed["client"], parsed["client"], parsed["price"], parsed["salary"], profit, now, now)
-        )
-        salary_text = f"{parsed['salary']}" if parsed['salary'] > 0 else "0 (не указана)"
-        await message.answer(f"✅ **Заявка сохранена!**\n\n"
-                             f"Сотрудник: {parsed['employee']}\n"
-                             f"Адрес/Клиент: {parsed['client']}\n"
-                             f"Цена: {parsed['price']}\n"
-                             f"Зарплата: {salary_text}\n"
-                             f"Прибыль: {profit}", parse_mode="Markdown")
-                             
-    elif parsed["type"] == "salary_payment":
-        execute_query(
-            "INSERT INTO salary_payments (employee, amount, type, comment, date, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (parsed["employee"], parsed["amount"], parsed["payment_type"], "Smart Parser", now, now)
-        )
-        await message.answer(f"✅ **{parsed['payment_type'].capitalize()} записан(а)!**\n\n"
-                             f"Сотрудник: {parsed['employee']}\n"
-                             f"Сумма: {parsed['amount']}", parse_mode="Markdown")
-                             
-    elif parsed["type"] == "expense":
-        execute_query(
-            "INSERT INTO expenses (category, amount, comment, date, created_at) VALUES (?, ?, ?, ?, ?)",
-            (parsed["category"], parsed["amount"], "Smart Parser", now, now)
-        )
-        await message.answer(f"✅ **Расход сохранен!**\n\n"
-                             f"Категория: {parsed['category']}\n"
-                             f"Сумма: {parsed['amount']}", parse_mode="Markdown")
-                             
-    elif parsed["type"] == "income":
-        execute_query(
-            "INSERT INTO income (source, amount, comment, date, created_at) VALUES (?, ?, ?, ?, ?)",
-            (parsed["source"], parsed["amount"], "Smart Parser", now, now)
-        )
-        await message.answer(f"✅ **Доход сохранен!**\n\n"
-                             f"Источник: {parsed['source']}\n"
-                             f"Сумма: {parsed['amount']}", parse_mode="Markdown")
-                             
-    elif parsed["type"] == "inventory":
-        item = parsed["item"]
-        qty = parsed["qty"]
-        action = parsed["action"]
-        
-        existing = execute_query("SELECT quantity FROM inventory WHERE item_name=?", (item,), fetch=True)
-        if existing:
-            new_qty = existing[0] + qty if action == "добавить" else existing[0] - qty
-            execute_query("UPDATE inventory SET quantity=? WHERE item_name=?", (new_qty, item))
-        else:
-            new_qty = qty if action == "добавить" else -qty
-            execute_query("INSERT INTO inventory (item_name, quantity, price, created_at) VALUES (?, ?, ?, ?)", (item, new_qty, 0, now))
-            
-        await message.answer(f"✅ **Склад обновлен!**\n\n"
-                             f"Товар: {item}\n"
-                             f"Действие: {action} {qty}\n"
-                             f"Остаток: {new_qty}", parse_mode="Markdown")
+    text = f"📊 **Панель управления**\n\nСегодня ({today}):\n🧹 Заявок: {jobs_today}\n💰 Прибыль: {profit_today} руб."
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=back_to_main_kb())
 
-# --- Handlers ---
+# --- HANDLERS: JOBS ---
+@router.callback_query(F.data == "menu_jobs")
+async def menu_jobs(callback: CallbackQuery):
+    await callback.message.edit_text("🧹 **Управление заявками**", parse_mode="Markdown", reply_markup=jobs_menu_kb())
 
-@dp.message(CommandStart())
-async def cmd_start(message: types.Message):
-    await message.answer("👋 Добро пожаловать в систему управления клининговой компанией!\n\n"
-                         "Вы можете использовать кнопки меню или писать запросы естественным языком.\n"
-                         "Например:\n"
-                         "• Анна 5000 аванс\n"
-                         "• химия 2000\n"
-                         "• Анна Пушкина 10 12000 зарплата 4000", reply_markup=menu_kb)
+@router.callback_query(F.data == "job_add")
+async def job_add_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Выберите сотрудника для заявки:", reply_markup=select_employee_kb())
+    await state.set_state(JobFSM.employee_id)
 
-@dp.message(Command("help"))
-async def cmd_help(message: types.Message):
-    help_text = """
-🛠 **Доступные команды и форматы:**
+@router.callback_query(JobFSM.employee_id, F.data.startswith("sel_emp_"))
+async def job_add_emp(callback: CallbackQuery, state: FSMContext):
+    emp_id = int(callback.data.split("_")[2])
+    await state.update_data(employee_id=emp_id)
+    await callback.message.edit_text("Введите имя клиента (или телефон):")
+    await state.set_state(JobFSM.client_name)
 
-**Умный ввод (текст или голос):**
-• `Анна 5000 аванс` - Выдать аванс
-• `Вася 3000 зарплата` - Выплатить зарплату
-• `химия 2000` - Записать расход
-• `клиент 15000` - Записать доход
-• `Анна Пушкина 10 12000 зарплата 4000` - Создать заявку
-• `добавить химия 5` - Пополнить склад
-• `списать химия 2` - Списать со склада
+@router.message(JobFSM.client_name)
+async def job_add_client(message: Message, state: FSMContext):
+    await state.update_data(client_name=message.text)
+    await message.answer("Введите адрес объекта:")
+    await state.set_state(JobFSM.address)
 
-**Команды:**
-/balance [Имя] - Баланс сотрудника
-/stats - Статистика
-/report - Отчет
-/job - Создать заявку по шагам
-/add_employee [Имя] - Добавить сотрудника
-/delete_employee [Имя] - Удалить сотрудника
-    """
-    await message.answer(help_text, parse_mode="Markdown")
-
-@dp.message(Command("add_employee"))
-async def cmd_add_employee(message: types.Message):
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("Укажите имя сотрудника: /add_employee Анна")
-        return
-    
-    employee = args[1].capitalize()
-    now = get_now()
-    execute_query("INSERT INTO employees (name, created_at) VALUES (?, ?)", (employee, now))
-    await message.answer(f"✅ Сотрудник {employee} добавлен.")
-
-@dp.message(Command("delete_employee"))
-async def cmd_delete_employee(message: types.Message):
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("Укажите имя сотрудника: /delete_employee Анна")
-        return
-    
-    employee = args[1].capitalize()
-    execute_query("DELETE FROM employees WHERE name=?", (employee,))
-    await message.answer(f"✅ Сотрудник {employee} удален.")
-
-@dp.message(Command("balance"))
-async def cmd_balance(message: types.Message):
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("Укажите имя сотрудника: /balance Анна")
-        return
-    
-    employee = args[1].capitalize()
-    
-    jobs = execute_query("SELECT SUM(employee_salary), COUNT(id) FROM jobs WHERE employee=?", (employee,), fetch=True)
-    earned = jobs[0] or 0
-    jobs_count = jobs[1] or 0
-    
-    payments = execute_query("SELECT SUM(amount) FROM salary_payments WHERE employee=?", (employee,), fetch=True)
-    paid = payments[0] or 0
-    
-    balance = earned - paid
-    
-    await message.answer(f"👤 **Баланс: {employee}**\n\n"
-                         f"Выполнено заявок: {jobs_count}\n"
-                         f"Заработано: {earned} руб.\n"
-                         f"Выплачено: {paid} руб.\n"
-                         f"К выплате: {balance} руб.", parse_mode="Markdown")
-
-@dp.message(Command("stats"))
-@dp.message(Command("today"))
-@dp.message(Command("dashboard"))
-@dp.message(F.text.in_({"📊 Панель", "📊 Статистика"}))
-async def cmd_stats(message: types.Message):
-    today = get_now()
-    month = today[3:] # MM.YYYY
-    
-    # Today
-    t_income = execute_query("SELECT SUM(amount) FROM income WHERE date=?", (today,), fetch=True)[0] or 0
-    t_jobs_price = execute_query("SELECT SUM(price) FROM jobs WHERE date=?", (today,), fetch=True)[0] or 0
-    t_total_income = t_income + t_jobs_price
-    
-    t_expenses = execute_query("SELECT SUM(amount) FROM expenses WHERE date=?", (today,), fetch=True)[0] or 0
-    t_salaries = execute_query("SELECT SUM(employee_salary) FROM jobs WHERE date=?", (today,), fetch=True)[0] or 0
-    t_profit = t_total_income - t_expenses - t_salaries
-    
-    # Month
-    m_income = execute_query("SELECT SUM(amount) FROM income WHERE date LIKE ?", (f"%{month}",), fetch=True)[0] or 0
-    m_jobs_price = execute_query("SELECT SUM(price) FROM jobs WHERE date LIKE ?", (f"%{month}",), fetch=True)[0] or 0
-    m_total_income = m_income + m_jobs_price
-    
-    m_expenses = execute_query("SELECT SUM(amount) FROM expenses WHERE date LIKE ?", (f"%{month}",), fetch=True)[0] or 0
-    m_salaries = execute_query("SELECT SUM(employee_salary) FROM jobs WHERE date LIKE ?", (f"%{month}",), fetch=True)[0] or 0
-    m_profit = m_total_income - m_expenses - m_salaries
-    
-    await message.answer(f"📊 **Статистика**\n\n"
-                         f"**Сегодня ({today}):**\n"
-                         f"Доход: {t_total_income}\n"
-                         f"Расходы: {t_expenses}\n"
-                         f"Зарплаты: {t_salaries}\n"
-                         f"Чистая прибыль: {t_profit}\n\n"
-                         f"**Этот месяц ({month}):**\n"
-                         f"Доход: {m_total_income}\n"
-                         f"Расходы: {m_expenses}\n"
-                         f"Зарплаты: {m_salaries}\n"
-                         f"Чистая прибыль: {m_profit}", parse_mode="Markdown")
-
-@dp.message(Command("report"))
-@dp.message(F.text == "📑 Отчет")
-async def cmd_report(message: types.Message):
-    month = get_now()[3:]
-    
-    m_jobs_count = execute_query("SELECT COUNT(id), SUM(price), SUM(profit) FROM jobs WHERE date LIKE ?", (f"%{month}",), fetch=True)
-    jobs_count = m_jobs_count[0] or 0
-    total_price = m_jobs_count[1] or 0
-    total_profit = m_jobs_count[2] or 0
-    
-    avg_check = round(total_price / jobs_count, 2) if jobs_count > 0 else 0
-    
-    top_employee = execute_query("SELECT employee, COUNT(id) as c FROM jobs WHERE date LIKE ? GROUP BY employee ORDER BY c DESC LIMIT 1", (f"%{month}",), fetch=True)
-    top_emp_name = top_employee[0] if top_employee else "Нет данных"
-    
-    await message.answer(f"📑 **Отчет за {month}**\n\n"
-                         f"Всего заявок: {jobs_count}\n"
-                         f"Средний чек: {avg_check} руб.\n"
-                         f"Прибыль с заявок: {total_profit} руб.\n"
-                         f"Лучший сотрудник: {top_emp_name}", parse_mode="Markdown")
-
-@dp.message(Command("inventory"))
-@dp.message(F.text == "📦 Склад")
-async def cmd_inventory(message: types.Message):
-    items = execute_query("SELECT item_name, quantity FROM inventory", fetchall=True)
-    if not items:
-        await message.answer("Склад пуст.")
-        return
-    
-    text = "📦 **Склад:**\n\n"
-    for item in items:
-        text += f"• {item[0]}: {item[1]} шт.\n"
-    await message.answer(text, parse_mode="Markdown")
-
-@dp.message(Command("jobs"))
-@dp.message(F.text == "🧹 Заявки")
-async def show_jobs(message: types.Message):
-    jobs = execute_query("SELECT employee, client, price, date FROM jobs ORDER BY id DESC LIMIT 5", fetchall=True)
-    if not jobs:
-        await message.answer("Заявок пока нет.")
-        return
-    res = "🧹 **Последние 5 заявок:**\n\n"
-    for j in jobs:
-        res += f"• {j[3]} | {j[0]} | {j[1]} | {j[2]} руб.\n"
-    await message.answer(res, parse_mode="Markdown")
-
-@dp.message(Command("employees"))
-@dp.message(F.text == "👥 Сотрудники")
-async def show_employees(message: types.Message):
-    emps = execute_query("SELECT DISTINCT employee FROM jobs", fetchall=True)
-    if not emps:
-        await message.answer("Сотрудников пока нет.")
-        return
-    res = "👥 **Сотрудники:**\n\n"
-    for e in emps:
-        res += f"• {e[0]}\n"
-    await message.answer(res, parse_mode="Markdown")
-
-@dp.message(Command("salary"))
-@dp.message(F.text == "💰 Зарплаты")
-async def show_salaries(message: types.Message):
-    payments = execute_query("SELECT employee, amount, type, date FROM salary_payments ORDER BY id DESC LIMIT 5", fetchall=True)
-    if not payments:
-        await message.answer("Выплат пока нет.")
-        return
-    res = "💰 **Последние выплаты:**\n\n"
-    for p in payments:
-        res += f"• {p[3]} | {p[0]} | {p[2]} | {p[1]} руб.\n"
-    await message.answer(res, parse_mode="Markdown")
-
-@dp.message(Command("expenses"))
-@dp.message(F.text == "📉 Расходы")
-async def show_expenses(message: types.Message):
-    expenses = execute_query("SELECT category, amount, date FROM expenses ORDER BY id DESC LIMIT 5", fetchall=True)
-    if not expenses:
-        await message.answer("Расходов пока нет.")
-        return
-    res = "📉 **Последние расходы:**\n\n"
-    for e in expenses:
-        res += f"• {e[2]} | {e[0]} | {e[1]} руб.\n"
-    await message.answer(res, parse_mode="Markdown")
-
-@dp.message(Command("income"))
-@dp.message(F.text == "📈 Доходы")
-async def show_incomes(message: types.Message):
-    incomes = execute_query("SELECT source, amount, date FROM income ORDER BY id DESC LIMIT 5", fetchall=True)
-    if not incomes:
-        await message.answer("Доходов пока нет.")
-        return
-    res = "📈 **Последние доходы:**\n\n"
-    for i in incomes:
-        res += f"• {i[2]} | {i[0]} | {i[1]} руб.\n"
-    await message.answer(res, parse_mode="Markdown")
-
-# --- Step-by-step Job Creation ---
-
-@dp.message(Command("job"))
-async def cmd_job(message: types.Message, state: FSMContext):
-    await message.answer("Введите имя сотрудника:")
-    await state.set_state(JobForm.employee)
-
-@dp.message(JobForm.employee)
-async def process_employee(message: types.Message, state: FSMContext):
-    await state.update_data(employee=message.text.capitalize())
-    await message.answer("Введите имя клиента (или адрес):")
-    await state.set_state(JobForm.client)
-
-@dp.message(JobForm.client)
-async def process_client(message: types.Message, state: FSMContext):
-    await state.update_data(client=message.text)
-    await message.answer("Введите адрес:")
-    await state.set_state(JobForm.address)
-
-@dp.message(JobForm.address)
-async def process_address(message: types.Message, state: FSMContext):
+@router.message(JobFSM.address)
+async def job_add_address(message: Message, state: FSMContext):
     await state.update_data(address=message.text)
-    await message.answer("Введите цену заказа (число):")
-    await state.set_state(JobForm.price)
+    await message.answer("Введите цену заказа (только число):")
+    await state.set_state(JobFSM.price)
 
-@dp.message(JobForm.price)
-async def process_price(message: types.Message, state: FSMContext):
+@router.message(JobFSM.price)
+async def job_add_price(message: Message, state: FSMContext):
     try:
-        price = float(message.text)
+        price = float(message.text.replace(",", "."))
         await state.update_data(price=price)
-        await message.answer("Введите зарплату сотрудника (число):")
-        await state.set_state(JobForm.salary)
+        await message.answer("Введите зарплату сотрудника за этот заказ (только число):")
+        await state.set_state(JobFSM.employee_salary)
     except ValueError:
-        await message.answer("Пожалуйста, введите число.")
+        await message.answer("Пожалуйста, введите корректное число.")
 
-@dp.message(JobForm.salary)
-async def process_salary(message: types.Message, state: FSMContext):
+@router.message(JobFSM.employee_salary)
+async def job_add_salary(message: Message, state: FSMContext):
     try:
-        salary = float(message.text)
-        data = await state.get_data()
-        
-        profit = data['price'] - salary
-        now = get_now()
-        
-        execute_query(
-            "INSERT INTO jobs (employee, client, address, price, employee_salary, profit, date, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (data['employee'], data['client'], data['address'], data['price'], salary, profit, now, now)
-        )
-        
-        await message.answer(f"✅ **Заявка сохранена!**\n\n"
-                             f"Сотрудник: {data['employee']}\n"
-                             f"Клиент: {data['client']}\n"
-                             f"Адрес: {data['address']}\n"
-                             f"Цена: {data['price']}\n"
-                             f"Зарплата: {salary}\n"
-                             f"Прибыль: {profit}", parse_mode="Markdown")
-        await state.clear()
+        salary = float(message.text.replace(",", "."))
+        await state.update_data(employee_salary=salary)
+        await message.answer("Выберите дату заявки:", reply_markup=date_kb("jobdate_"))
+        await state.set_state(JobFSM.date)
     except ValueError:
-        await message.answer("Пожалуйста, введите число.")
+        await message.answer("Пожалуйста, введите корректное число.")
 
-# --- Voice Processing ---
+@router.callback_query(JobFSM.date, F.data.startswith("jobdate_"))
+async def job_add_date_cb(callback: CallbackQuery, state: FSMContext):
+    date_val = callback.data.split("_")[1]
+    if date_val == "manual":
+        await callback.message.edit_text("Введите дату в формате ДД.ММ.ГГГГ:")
+        return
+    await process_job_save(callback.message, state, date_val)
 
-@dp.message(F.voice)
-async def handle_voice(message: types.Message, bot: Bot):
+@router.message(JobFSM.date)
+async def job_add_date_manual(message: Message, state: FSMContext):
+    await process_job_save(message, state, message.text)
+
+async def process_job_save(message: Message, state: FSMContext, date_str: str):
+    data = await state.get_data()
+    profit = data['price'] - data['employee_salary']
+    
+    conn = get_db_connection()
+    conn.execute('''
+        INSERT INTO jobs (employee_id, client_name, address, price, employee_salary, profit, date)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (data['employee_id'], data['client_name'], data['address'], data['price'], data['employee_salary'], profit, date_str))
+    conn.commit()
+    conn.close()
+    
+    await state.clear()
+    text = f"✅ Заявка успешно добавлена!\n\nКлиент: {data['client_name']}\nАдрес: {data['address']}\nЦена: {data['price']}\nЗП: {data['employee_salary']}\nПрибыль: {profit}\nДата: {date_str}"
+    
+    if isinstance(message, Message):
+        await message.answer(text, reply_markup=back_to_main_kb())
+    else:
+        await message.edit_text(text, reply_markup=back_to_main_kb())
+
+@router.callback_query(F.data == "job_view")
+async def job_view(callback: CallbackQuery):
+    conn = get_db_connection()
+    jobs = conn.execute('''
+        SELECT j.id, e.name as emp_name, j.client_name, j.price, j.date 
+        FROM jobs j JOIN employees e ON j.employee_id = e.id 
+        ORDER BY j.id DESC LIMIT 10
+    ''').fetchall()
+    conn.close()
+    
+    if not jobs:
+        await callback.message.edit_text("Заявок пока нет.", reply_markup=back_to_main_kb())
+        return
+        
+    text = "📋 **Последние 10 заявок:**\n\n"
+    for j in jobs:
+        text += f"ID: {j['id']} | {j['date']} | {j['emp_name']} | {j['client_name']} | {j['price']} руб.\n"
+        
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=back_to_main_kb())
+
+# --- HANDLERS: EMPLOYEES ---
+@router.callback_query(F.data == "menu_employees")
+async def menu_employees(callback: CallbackQuery):
+    await callback.message.edit_text("👥 **Сотрудники**", parse_mode="Markdown", reply_markup=employees_menu_kb())
+
+@router.callback_query(F.data == "emp_add")
+async def emp_add_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введите ФИО сотрудника:")
+    await state.set_state(EmployeeFSM.name)
+
+@router.message(EmployeeFSM.name)
+async def emp_add_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("Введите телефон сотрудника:")
+    await state.set_state(EmployeeFSM.phone)
+
+@router.message(EmployeeFSM.phone)
+async def emp_add_phone(message: Message, state: FSMContext):
+    await state.update_data(phone=message.text)
+    await message.answer("Введите должность (например, Клинер):")
+    await state.set_state(EmployeeFSM.role)
+
+@router.message(EmployeeFSM.role)
+async def emp_add_role(message: Message, state: FSMContext):
+    data = await state.get_data()
+    role = message.text
+    
+    conn = get_db_connection()
+    conn.execute('INSERT INTO employees (name, phone, role) VALUES (?, ?, ?)', (data['name'], data['phone'], role))
+    conn.commit()
+    conn.close()
+    
+    await state.clear()
+    await message.answer(f"✅ Сотрудник {data['name']} добавлен!", reply_markup=back_to_main_kb())
+
+@router.callback_query(F.data == "emp_view")
+async def emp_view(callback: CallbackQuery):
+    conn = get_db_connection()
+    emps = conn.execute('SELECT * FROM employees').fetchall()
+    conn.close()
+    
+    if not emps:
+        await callback.message.edit_text("Сотрудников пока нет.", reply_markup=back_to_main_kb())
+        return
+        
+    text = "📋 **Список сотрудников:**\n\n"
+    for e in emps:
+        text += f"ID: {e['id']} | {e['name']} | {e['phone']} | {e['role']}\n"
+        
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=back_to_main_kb())
+
+# --- HANDLERS: EXPENSES ---
+@router.callback_query(F.data == "menu_expenses")
+async def menu_expenses(callback: CallbackQuery):
+    await callback.message.edit_text("📉 **Расходы**", parse_mode="Markdown", reply_markup=finance_menu_kb("exp"))
+
+@router.callback_query(F.data == "exp_add")
+async def exp_add_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введите категорию расхода (например, Химия, Бензин):")
+    await state.set_state(ExpenseFSM.category)
+
+@router.message(ExpenseFSM.category)
+async def exp_add_cat(message: Message, state: FSMContext):
+    await state.update_data(category=message.text)
+    await message.answer("Введите сумму (только число):")
+    await state.set_state(ExpenseFSM.amount)
+
+@router.message(ExpenseFSM.amount)
+async def exp_add_amount(message: Message, state: FSMContext):
+    try:
+        amount = float(message.text.replace(",", "."))
+        await state.update_data(amount=amount)
+        await message.answer("Введите комментарий:")
+        await state.set_state(ExpenseFSM.comment)
+    except ValueError:
+        await message.answer("Пожалуйста, введите корректное число.")
+
+@router.message(ExpenseFSM.comment)
+async def exp_add_comment(message: Message, state: FSMContext):
+    data = await state.get_data()
+    comment = message.text
+    date_str = datetime.now(TZ).strftime("%d.%m.%Y")
+    
+    conn = get_db_connection()
+    conn.execute('INSERT INTO expenses (category, amount, comment, date) VALUES (?, ?, ?, ?)', 
+                 (data['category'], data['amount'], comment, date_str))
+    conn.commit()
+    conn.close()
+    
+    await state.clear()
+    await message.answer(f"✅ Расход добавлен!\nСумма: {data['amount']} руб.\nКатегория: {data['category']}", reply_markup=back_to_main_kb())
+
+@router.callback_query(F.data == "exp_view")
+async def exp_view(callback: CallbackQuery):
+    conn = get_db_connection()
+    exps = conn.execute('SELECT * FROM expenses ORDER BY id DESC LIMIT 10').fetchall()
+    conn.close()
+    
+    if not exps:
+        await callback.message.edit_text("Расходов пока нет.", reply_markup=back_to_main_kb())
+        return
+        
+    text = "📋 **Последние 10 расходов:**\n\n"
+    for e in exps:
+        text += f"{e['date']} | {e['category']} | {e['amount']} руб. | {e['comment']}\n"
+        
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=back_to_main_kb())
+
+# --- HANDLERS: REPORTS & STATISTICS ---
+@router.callback_query(F.data == "menu_reports")
+async def menu_reports(callback: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Месячный отчет", callback_data="rep_month")],
+        [InlineKeyboardButton(text="🏆 Топ сотрудник", callback_data="rep_top_emp")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+    ])
+    await callback.message.edit_text("📑 **Отчеты**", parse_mode="Markdown", reply_markup=kb)
+
+@router.callback_query(F.data == "rep_month")
+async def rep_month(callback: CallbackQuery):
+    current_month = datetime.now(TZ).strftime(".%m.%Y")
+    conn = get_db_connection()
+    
+    # Income from jobs
+    jobs_income = conn.execute("SELECT SUM(price) FROM jobs WHERE date LIKE ?", (f"%{current_month}",)).fetchone()[0] or 0
+    jobs_profit = conn.execute("SELECT SUM(profit) FROM jobs WHERE date LIKE ?", (f"%{current_month}",)).fetchone()[0] or 0
+    
+    # Other income
+    other_income = conn.execute("SELECT SUM(amount) FROM income WHERE date LIKE ?", (f"%{current_month}",)).fetchone()[0] or 0
+    
+    # Expenses
+    expenses = conn.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE ?", (f"%{current_month}",)).fetchone()[0] or 0
+    
+    conn.close()
+    
+    total_income = jobs_income + other_income
+    net_profit = jobs_profit + other_income - expenses
+    
+    text = f"📅 **Отчет за текущий месяц ({current_month})**\n\n"
+    text += f"📈 Оборот (заявки): {jobs_income} руб.\n"
+    text += f"📈 Доп. доходы: {other_income} руб.\n"
+    text += f"📉 Расходы: {expenses} руб.\n"
+    text += f"💰 **Чистая прибыль: {net_profit} руб.**"
+    
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=back_to_main_kb())
+
+@router.callback_query(F.data == "rep_top_emp")
+async def rep_top_emp(callback: CallbackQuery):
+    current_month = datetime.now(TZ).strftime(".%m.%Y")
+    conn = get_db_connection()
+    
+    top_emps = conn.execute('''
+        SELECT e.name, COUNT(j.id) as job_count, SUM(j.price) as total_brought
+        FROM jobs j
+        JOIN employees e ON j.employee_id = e.id
+        WHERE j.date LIKE ?
+        GROUP BY e.id
+        ORDER BY total_brought DESC
+        LIMIT 5
+    ''', (f"%{current_month}",)).fetchall()
+    
+    conn.close()
+    
+    if not top_emps:
+        await callback.message.edit_text("Нет данных за этот месяц.", reply_markup=back_to_main_kb())
+        return
+        
+    text = f"🏆 **Топ сотрудников за месяц ({current_month})**\n\n"
+    for i, emp in enumerate(top_emps, 1):
+        text += f"{i}. {emp['name']} — {emp['job_count']} заявок, принес {emp['total_brought']} руб.\n"
+        
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=back_to_main_kb())
+
+# --- VOICE RECOGNITION ---
+@router.message(F.voice)
+async def handle_voice(message: Message):
     msg = await message.answer("⏳ Обработка голосового сообщения...")
-    file_id = message.voice.file_id
-    file = await bot.get_file(file_id)
-    file_path = file.file_path
-    
-    ogg_io = io.BytesIO()
-    await bot.download_file(file_path, destination=ogg_io)
-    ogg_io.seek(0)
-    
     try:
-        audio = AudioSegment.from_file(ogg_io, format="ogg")
+        # Download voice
+        file_id = message.voice.file_id
+        file = await bot.get_file(file_id)
+        file_path = file.file_path
+        
+        voice_io = io.BytesIO()
+        await bot.download_file(file_path, voice_io)
+        voice_io.seek(0)
+        
+        # Convert ogg to wav
+        audio = AudioSegment.from_file(voice_io, format="ogg")
         wav_io = io.BytesIO()
         audio.export(wav_io, format="wav")
         wav_io.seek(0)
         
+        # Recognize
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_io) as source:
             audio_data = recognizer.record(source)
             text = recognizer.recognize_google(audio_data, language="ru-RU")
             
-        await msg.edit_text(f"🎤 Распознано: {text}")
-        await process_text_message(message, text)
-        
-    except sr.UnknownValueError:
-        await msg.edit_text("❌ Не удалось распознать речь.")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Создать заявку", callback_data="job_add")],
+            [InlineKeyboardButton(text="📉 Добавить расход", callback_data="exp_add")],
+            [InlineKeyboardButton(text="🔙 Отмена", callback_data="back_to_main")]
+        ])
+        await msg.edit_text(f"🎙 **Распознанный текст:**\n_{text}_\n\nЧто вы хотите сделать с этой информацией?", parse_mode="Markdown", reply_markup=kb)
     except Exception as e:
-        logging.error(f"Voice error: {e}")
-        await msg.edit_text("❌ Ошибка при обработке аудио.")
+        logging.error(f"Voice recognition error: {e}")
+        await msg.edit_text("❌ Не удалось распознать голосовое сообщение. Убедитесь, что установлен ffmpeg.", reply_markup=back_to_main_kb())
 
-# --- Text Fallback (Smart Parser) ---
-@dp.message(F.text & ~F.text.startswith('/'))
-async def handle_text(message: types.Message, state: FSMContext):
-    # Ignore if in FSM
-    current_state = await state.get_state()
-    if current_state is not None:
-        return
-        
-    await process_text_message(message, message.text)
-
+# --- MAIN RUNNER ---
 async def main():
     if not BOT_TOKEN:
-        logging.error("Cannot start bot without BOT_TOKEN")
+        print("ERROR: BOT_TOKEN environment variable is missing.")
         return
+    print("Starting bot...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
