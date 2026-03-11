@@ -28,12 +28,14 @@ def jobs_menu_kb():
     ])
 
 def employees_menu_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить сотрудника", callback_data="emp_add")],
         [InlineKeyboardButton(text="📋 Просмотр списка", callback_data="emp_view")],
         [InlineKeyboardButton(text="📈 Статистика сотрудника", callback_data="emp_stats")],
+        [InlineKeyboardButton(text="❌ Удалить сотрудника", callback_data="emp_del")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
     ])
+    return kb
 
 def finance_menu_kb(type_name):
     return InlineKeyboardMarkup(inline_keyboard=[
