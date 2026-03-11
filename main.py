@@ -11,7 +11,7 @@ from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from extra_handlers import extra_router
+from extra_handlers import extra_router, process_quick_add
 
 # Voice recognition
 import speech_recognition as sr
@@ -52,6 +52,23 @@ init_db()
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("👋 Добро пожаловать в систему управления клининговой компанией!\nВыберите раздел:", reply_markup=main_menu_kb())
+
+@router.message(F.text == "/help")
+async def cmd_help(message: Message):
+    help_text = (
+        "🛠 **Справка по использованию бота:**\n\n"
+        "1️⃣ **Быстрое добавление заявок:**\n"
+        "Вы можете просто написать текст или отправить голосовое сообщение.\n"
+        "Пример: `Анна 5000 2500 улица Ленина 10`\n"
+        "Бот сам найдет сотрудника 'Анна', установит цену 5000, зарплату 2500 и адрес 'Улица Ленина 10'.\n\n"
+        "2️⃣ **Отмена действий:**\n"
+        "Если вы ошиблись при вводе данных, просто напишите слово `отмена` или `/cancel`.\n\n"
+        "3️⃣ **Удаление записей:**\n"
+        "В каждом разделе есть кнопка '❌ Удалить', где вы можете удалить последние записи по их ID.\n\n"
+        "4️⃣ **Отчеты:**\n"
+        "В разделе 'Отчет' вы можете выгрузить все данные в формате Excel (.xlsx)."
+    )
+    await message.answer(help_text, parse_mode="Markdown")
 
 @router.message(F.text.lower().in_(["отмена", "cancel", "/cancel"]))
 async def cancel_handler(message: Message, state: FSMContext):
@@ -378,12 +395,8 @@ async def handle_voice(message: Message):
             audio_data = recognizer.record(source)
             text = recognizer.recognize_google(audio_data, language="ru-RU")
             
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Создать заявку", callback_data="job_add")],
-            [InlineKeyboardButton(text="📉 Добавить расход", callback_data="exp_add")],
-            [InlineKeyboardButton(text="🔙 Отмена", callback_data="back_to_main")]
-        ])
-        await msg.edit_text(f"🎙 **Распознанный текст:**\n_{text}_\n\nЧто вы хотите сделать с этой информацией?", parse_mode="Markdown", reply_markup=kb)
+        await msg.delete()
+        await process_quick_add(text, message)
     except Exception as e:
         logging.error(f"Voice recognition error: {e}")
         await msg.edit_text("❌ Не удалось распознать голосовое сообщение. Убедитесь, что установлен ffmpeg.", reply_markup=back_to_main_kb())
