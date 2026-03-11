@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timedelta
-import pytz
+from zoneinfo import ZoneInfo
 import io
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -20,19 +20,18 @@ logging.basicConfig(level=logging.INFO)
 
 # Environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    logging.warning("BOT_TOKEN is not set. Please set it in your environment variables.")
-    # Fallback for testing purposes if needed, but should raise error in production
-    # raise ValueError("No BOT_TOKEN provided")
 
 # Initialize bot and dispatcher
-bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN is not set. Please set it in your environment variables.")
+
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
 # Timezone
-TZ = pytz.timezone('Europe/Moscow')
+TZ = ZoneInfo('Europe/Moscow')
 
 # --- DATABASE SETUP ---
 from database import init_db, get_db_connection
@@ -453,10 +452,7 @@ async def handle_voice(message: Message):
 
 # --- MAIN RUNNER ---
 async def main():
-    if not BOT_TOKEN:
-        print("ERROR: BOT_TOKEN environment variable is missing.")
-        return
-    print("Starting bot...")
+    logging.info("Starting bot...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
