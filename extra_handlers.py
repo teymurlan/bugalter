@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import io
@@ -332,7 +333,71 @@ async def delete_confirm(message: Message, state: FSMContext):
 async def unknown_message(message: Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state is None:
-        await message.answer("🤔 Я не понимаю это сообщение. Пожалуйста, используйте кнопки меню.", reply_markup=main_menu_kb())
+        if message.text:
+            await process_quick_add(message.text, message)
+        else:
+            await message.answer("🤔 Я не понимаю это сообщение. Пожалуйста, используйте кнопки меню.", reply_markup=main_menu_kb())
+
+async def process_quick_add(text: str, message: Message):
+    text_lower = text.lower()
+    conn = get_db_connection()
+    employees = conn.execute("SELECT id, name FROM employees").fetchall()
+    
+    # 1. Find numbers
+    numbers = [int(n) for n in re.findall(r'\b\d+\b', text)]
+    price = 0
+    salary = 0
+    
+    if numbers:
+        large_numbers = [n for n in numbers if n >= 100]
+        if large_numbers:
+            price = large_numbers[0]
+            if len(large_numbers) > 1:
+                salary = large_numbers[1]
+        else:
+            price = numbers[0]
+            if len(numbers) > 1:
+                salary = numbers[1]
+                
+    # 2. Find employee
+    emp_id = None
+    emp_name_found = ""
+    for emp in employees:
+        emp_name = emp['name'].lower()
+        if re.search(rf'\b{re.escape(emp_name)}\b', text_lower):
+            emp_id = emp['id']
+            emp_name_found = emp['name']
+            break
+            
+    if not emp_id:
+        conn.close()
+        await message.answer(f"Текст: '{text}'\n\n⚠️ Не удалось найти сотрудника в тексте. Пожалуйста, добавьте заявку через меню.", reply_markup=main_menu_kb())
+        return
+        
+    # 3. Extract address
+    address = text_lower
+    if price > 0:
+        address = re.sub(rf'\b{price}\b', '', address, count=1)
+    if salary > 0:
+        address = re.sub(rf'\b{salary}\b', '', address, count=1)
+    address = re.sub(rf'\b{re.escape(emp_name_found.lower())}\b', '', address, count=1)
+    
+    # Clean up extra spaces and punctuation
+    address = " ".join(address.split()).strip(' ,.-').title()
+    if not address:
+        address = "Не указан"
+        
+    profit = price - salary
+    date_str = datetime.now(TZ).strftime("%d.%m.%Y")
+    
+    conn.execute('''
+        INSERT INTO jobs (employee_id, client_name, address, price, employee_salary, profit, date)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (emp_id, "Быстрое добавление", address, price, salary, profit, date_str))
+    conn.commit()
+    conn.close()
+    
+    await message.answer(f"✅ **Заявка быстро добавлена!**\n\nСотрудник: {emp_name_found}\nАдрес: {address}\nЦена: {price} руб.\nЗарплата: {salary} руб.", parse_mode="Markdown", reply_markup=back_to_main_kb())
 
 @extra_router.callback_query()
 async def unknown_callback(callback: CallbackQuery):
