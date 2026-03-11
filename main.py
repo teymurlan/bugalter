@@ -11,6 +11,8 @@ from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
+from extra_handlers import extra_router
+
 # Voice recognition
 import speech_recognition as sr
 from pydub import AudioSegment
@@ -29,100 +31,35 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
+dp.include_router(extra_router)
 
 # Timezone
-TZ = ZoneInfo('Europe/Moscow')
+from keyboards import (
+    TZ, main_menu_kb, back_to_main_kb, jobs_menu_kb, employees_menu_kb,
+    finance_menu_kb, select_employee_kb, date_kb
+)
+from states import (
+    JobFSM, EmployeeFSM, ExpenseFSM, IncomeFSM, SalaryFSM, InventoryFSM
+)
 
 # --- DATABASE SETUP ---
 from database import init_db, get_db_connection
 
 init_db()
 
-# --- KEYBOARDS ---
-def main_menu_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Панель", callback_data="menu_panel"), InlineKeyboardButton(text="🧹 Заявки", callback_data="menu_jobs")],
-        [InlineKeyboardButton(text="👥 Сотрудники", callback_data="menu_employees"), InlineKeyboardButton(text="💰 Зарплаты", callback_data="menu_salaries")],
-        [InlineKeyboardButton(text="📉 Расходы", callback_data="menu_expenses"), InlineKeyboardButton(text="📈 Доходы", callback_data="menu_income")],
-        [InlineKeyboardButton(text="📦 Склад", callback_data="menu_inventory"), InlineKeyboardButton(text="📑 Отчет", callback_data="menu_reports")],
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="menu_statistics")]
-    ])
-
-def back_to_main_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_main")]
-    ])
-
-def jobs_menu_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить заявку", callback_data="job_add")],
-        [InlineKeyboardButton(text="📋 Просмотр заявок", callback_data="job_view")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
-    ])
-
-def employees_menu_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить сотрудника", callback_data="emp_add")],
-        [InlineKeyboardButton(text="📋 Просмотр списка", callback_data="emp_view")],
-        [InlineKeyboardButton(text="📈 Статистика сотрудника", callback_data="emp_stats")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
-    ])
-
-def finance_menu_kb(type_name):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить", callback_data=f"{type_name}_add")],
-        [InlineKeyboardButton(text="📋 Просмотр", callback_data=f"{type_name}_view")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
-    ])
-
-def select_employee_kb(prefix="sel_emp_"):
-    conn = get_db_connection()
-    employees = conn.execute("SELECT id, name FROM employees").fetchall()
-    conn.close()
-    kb = []
-    for emp in employees:
-        kb.append([InlineKeyboardButton(text=emp['name'], callback_data=f"{prefix}{emp['id']}")])
-    kb.append([InlineKeyboardButton(text="🔙 Отмена", callback_data="back_to_main")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
-def date_kb(prefix="date_"):
-    today = datetime.now(TZ).strftime("%d.%m.%Y")
-    tomorrow = (datetime.now(TZ) + timedelta(days=1)).strftime("%d.%m.%Y")
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Сегодня ({today})", callback_data=f"{prefix}{today}")],
-        [InlineKeyboardButton(text=f"Завтра ({tomorrow})", callback_data=f"{prefix}{tomorrow}")],
-        [InlineKeyboardButton(text="Ввести вручную", callback_data=f"{prefix}manual")]
-    ])
-
-# --- STATES ---
-class JobFSM(StatesGroup):
-    employee_id = State()
-    client_name = State()
-    address = State()
-    price = State()
-    employee_salary = State()
-    date = State()
-
-class EmployeeFSM(StatesGroup):
-    name = State()
-    phone = State()
-    role = State()
-
-class ExpenseFSM(StatesGroup):
-    category = State()
-    amount = State()
-    comment = State()
-
-class IncomeFSM(StatesGroup):
-    source = State()
-    amount = State()
-    comment = State()
-
 # --- HANDLERS: MAIN MENU ---
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("👋 Добро пожаловать в систему управления клининговой компанией!\nВыберите раздел:", reply_markup=main_menu_kb())
+
+@router.message(F.text.lower().in_(["отмена", "cancel", "/cancel"]))
+async def cancel_handler(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        return
+    await state.clear()
+    await message.answer("❌ Действие отменено.", reply_markup=main_menu_kb())
 
 @router.callback_query(F.data == "back_to_main")
 async def back_to_main(callback: CallbackQuery, state: FSMContext):
@@ -355,6 +292,7 @@ async def menu_reports(callback: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📅 Месячный отчет", callback_data="rep_month")],
         [InlineKeyboardButton(text="🏆 Топ сотрудник", callback_data="rep_top_emp")],
+        [InlineKeyboardButton(text="📊 Экспорт в Excel", callback_data="export_excel")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
     ])
     await callback.message.edit_text("📑 **Отчеты**", parse_mode="Markdown", reply_markup=kb)
@@ -453,6 +391,7 @@ async def handle_voice(message: Message):
 # --- MAIN RUNNER ---
 async def main():
     logging.info("Starting bot...")
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
