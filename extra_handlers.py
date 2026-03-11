@@ -14,7 +14,7 @@ from database import get_db_connection
 from keyboards import (
     TZ, back_to_main_kb, main_menu_kb, finance_menu_kb, select_employee_kb
 )
-from states import SalaryFSM, IncomeFSM, InventoryFSM, DeleteFSM
+from states import SalaryFSM, IncomeFSM, InventoryFSM, DeleteFSM, ExpenseFSM
 
 extra_router = Router()
 
@@ -154,6 +154,7 @@ async def menu_inventory(callback: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить на склад", callback_data="inv_add")],
         [InlineKeyboardButton(text="📋 Просмотр склада", callback_data="inv_view")],
+        [InlineKeyboardButton(text="❌ Удалить со склада", callback_data="inv_del")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
     ])
     await callback.message.edit_text("📦 **Склад (Материалы/Химия)**", parse_mode="Markdown", reply_markup=kb)
@@ -271,14 +272,15 @@ async def export_excel(callback: CallbackQuery):
     os.remove(tmp_path)
 
 # --- CATCH ALL & CANCEL ---
-@extra_router.callback_query(F.data.in_(["job_del", "exp_del", "inc_del", "sal_del", "inv_del"]))
+@extra_router.callback_query(F.data.in_(["job_del", "exp_del", "inc_del", "sal_del", "inv_del", "emp_del"]))
 async def delete_start(callback: CallbackQuery, state: FSMContext):
     table_map = {
         "job_del": "jobs",
         "exp_del": "expenses",
         "inc_del": "income",
         "sal_del": "salary_payments",
-        "inv_del": "inventory"
+        "inv_del": "inventory",
+        "emp_del": "employees"
     }
     table_name = table_map[callback.data]
     await state.update_data(table_name=table_name)
@@ -303,6 +305,8 @@ async def delete_start(callback: CallbackQuery, state: FSMContext):
             text += f"ID: {i['id']} | {i['type']} | {i['amount']} руб.\n"
         elif table_name == "inventory":
             text += f"ID: {i['id']} | {i['item_name']} | {i['quantity']} шт.\n"
+        elif table_name == "employees":
+            text += f"ID: {i['id']} | {i['name']} | {i['role']}\n"
             
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=back_to_main_kb())
     await state.set_state(DeleteFSM.item_id)
