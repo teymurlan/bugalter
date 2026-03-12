@@ -222,14 +222,19 @@ async def menu_statistics(callback: CallbackQuery):
     total_profit = conn.execute("SELECT SUM(profit) FROM jobs").fetchone()[0] or 0
     total_expenses = conn.execute("SELECT SUM(amount) FROM expenses").fetchone()[0] or 0
     total_salaries = conn.execute("SELECT SUM(amount) FROM salary_payments").fetchone()[0] or 0
+    total_income = conn.execute("SELECT SUM(amount) FROM income").fetchone()[0] or 0
     
     conn.close()
+    
+    net_profit = total_profit + total_income - total_expenses
     
     text = "📊 **Общая статистика за все время:**\n\n"
     text += f"🧹 Всего заявок: {total_jobs}\n"
     text += f"💰 Общая прибыль (с заявок): {total_profit} руб.\n"
+    text += f"🎁 Доп. доходы: {total_income} руб.\n"
     text += f"📉 Всего расходов: {total_expenses} руб.\n"
-    text += f"💸 Выплачено зарплат: {total_salaries} руб.\n"
+    text += f"💸 Выплачено зарплат: {total_salaries} руб.\n\n"
+    text += f"💎 **Чистая прибыль: {net_profit} руб.**\n"
     
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=back_to_main_kb())
 
@@ -257,6 +262,27 @@ async def export_excel(callback: CallbackQuery):
     exps = conn.execute("SELECT * FROM expenses").fetchall()
     for e in exps:
         ws_exp.append([e['id'], e['category'], e['amount'], e['comment'], e['date']])
+        
+    # Income sheet
+    ws_inc = wb.create_sheet("Доходы")
+    ws_inc.append(["ID", "Источник", "Сумма", "Комментарий", "Дата"])
+    incs = conn.execute("SELECT * FROM income").fetchall()
+    for i in incs:
+        ws_inc.append([i['id'], i['source'], i['amount'], i['comment'], i['date']])
+        
+    # Salaries sheet
+    ws_sal = wb.create_sheet("Зарплаты")
+    ws_sal.append(["ID", "Сотрудник", "Сумма", "Тип", "Комментарий", "Дата"])
+    sals = conn.execute("SELECT s.id, e.name, s.amount, s.type, s.comment, s.date FROM salary_payments s JOIN employees e ON s.employee_id = e.id").fetchall()
+    for s in sals:
+        ws_sal.append(list(s))
+        
+    # Inventory sheet
+    ws_inv = wb.create_sheet("Склад")
+    ws_inv.append(["ID", "Название", "Количество", "Цена"])
+    invs = conn.execute("SELECT * FROM inventory").fetchall()
+    for v in invs:
+        ws_inv.append([v['id'], v['item_name'], v['quantity'], v['price']])
         
     conn.close()
     
@@ -345,25 +371,73 @@ async def unknown_message(message: Message, state: FSMContext):
 async def process_quick_add(text: str, message: Message):
     text_lower = text.lower()
     conn = get_db_connection()
-    employees = conn.execute("SELECT id, name FROM employees").fetchall()
     
     # 1. Find numbers
     numbers = [int(n) for n in re.findall(r'\b\d+\b', text)]
-    price = 0
-    salary = 0
+    val1 = 0
+    val2 = 0
     
     if numbers:
         large_numbers = [n for n in numbers if n >= 100]
         if large_numbers:
-            price = large_numbers[0]
+            val1 = large_numbers[0]
             if len(large_numbers) > 1:
-                salary = large_numbers[1]
+                val2 = large_numbers[1]
         else:
-            price = numbers[0]
+            val1 = numbers[0]
             if len(numbers) > 1:
-                salary = numbers[1]
+                val2 = numbers[1]
                 
-    # 2. Find employee
+    date_str = datetime.now(TZ).strftime("%d.%m.%Y")
+    
+    # Check for Expense
+    if any(word in text_lower for word in ["расход", "трата", "покупка"]):
+        amount = val1
+        if amount == 0:
+            await message.answer("⚠️ Не найдена сумма для расхода. Напишите, например: 'Расход 500 бензин'")
+            conn.close()
+            return
+            
+        # Clean up text for comment
+        comment = text_lower
+        comment = re.sub(r'\b(расход|трата|покупка)\b', '', comment, count=1)
+        comment = re.sub(rf'\b{amount}\b', '', comment, count=1)
+        comment = " ".join(comment.split()).strip(' ,.-').capitalize()
+        if not comment:
+            comment = "Быстрый расход"
+            
+        conn.execute('INSERT INTO expenses (category, amount, comment, date) VALUES (?, ?, ?, ?)', 
+                     ("Быстрый расход", amount, comment, date_str))
+        conn.commit()
+        conn.close()
+        await message.answer(f"✅ **Расход быстро добавлен!**\n\nСумма: {amount} руб.\nКомментарий: {comment}", parse_mode="Markdown", reply_markup=back_to_main_kb())
+        return
+
+    # Check for Income
+    if any(word in text_lower for word in ["доход", "прибыль"]):
+        amount = val1
+        if amount == 0:
+            await message.answer("⚠️ Не найдена сумма для дохода. Напишите, например: 'Доход 1000 чаевые'")
+            conn.close()
+            return
+            
+        # Clean up text for source
+        source = text_lower
+        source = re.sub(r'\b(доход|прибыль)\b', '', source, count=1)
+        source = re.sub(rf'\b{amount}\b', '', source, count=1)
+        source = " ".join(source.split()).strip(' ,.-').capitalize()
+        if not source:
+            source = "Быстрый доход"
+            
+        conn.execute('INSERT INTO income (source, amount, comment, date) VALUES (?, ?, ?, ?)', 
+                     (source, amount, "", date_str))
+        conn.commit()
+        conn.close()
+        await message.answer(f"✅ **Доход быстро добавлен!**\n\nСумма: {amount} руб.\nИсточник: {source}", parse_mode="Markdown", reply_markup=back_to_main_kb())
+        return
+
+    # Find employee (needed for Job or Salary)
+    employees = conn.execute("SELECT id, name FROM employees").fetchall()
     emp_id = None
     emp_name_found = ""
     for emp in employees:
@@ -375,10 +449,40 @@ async def process_quick_add(text: str, message: Message):
             
     if not emp_id:
         conn.close()
-        await message.answer(f"Текст: '{text}'\n\n⚠️ Не удалось найти сотрудника в тексте. Пожалуйста, добавьте заявку через меню.", reply_markup=main_menu_kb())
+        await message.answer(f"Текст: '{text}'\n\n⚠️ Не удалось найти сотрудника в тексте. Пожалуйста, добавьте запись через меню.", reply_markup=main_menu_kb())
         return
+
+    # Check for Salary
+    if any(word in text_lower for word in ["зарплата", "зп", "аванс", "выплата"]):
+        amount = val1
+        if amount == 0:
+            await message.answer("⚠️ Не найдена сумма для выплаты. Напишите, например: 'Зарплата Анна 5000'")
+            conn.close()
+            return
+            
+        sal_type = "Аванс" if "аванс" in text_lower else "Зарплата"
         
-    # 3. Extract address
+        # Clean up text for comment
+        comment = text_lower
+        comment = re.sub(r'\b(зарплата|зп|аванс|выплата)\b', '', comment, count=1)
+        comment = re.sub(rf'\b{amount}\b', '', comment, count=1)
+        comment = re.sub(rf'\b{re.escape(emp_name_found.lower())}\b', '', comment, count=1)
+        comment = " ".join(comment.split()).strip(' ,.-').capitalize()
+        if not comment:
+            comment = "-"
+            
+        conn.execute('INSERT INTO salary_payments (employee_id, amount, type, comment, date) VALUES (?, ?, ?, ?, ?)', 
+                     (emp_id, amount, sal_type, comment, date_str))
+        conn.commit()
+        conn.close()
+        await message.answer(f"✅ **Выплата быстро добавлена!**\n\nСотрудник: {emp_name_found}\nТип: {sal_type}\nСумма: {amount} руб.\nКомментарий: {comment}", parse_mode="Markdown", reply_markup=back_to_main_kb())
+        return
+
+    # Default: Add Job
+    price = val1
+    salary = val2
+    
+    # Extract address
     address = text_lower
     if price > 0:
         address = re.sub(rf'\b{price}\b', '', address, count=1)
@@ -392,7 +496,6 @@ async def process_quick_add(text: str, message: Message):
         address = "Не указан"
         
     profit = price - salary
-    date_str = datetime.now(TZ).strftime("%d.%m.%Y")
     
     conn.execute('''
         INSERT INTO jobs (employee_id, client_name, address, price, employee_salary, profit, date)
