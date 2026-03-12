@@ -87,11 +87,26 @@ async def back_to_main(callback: CallbackQuery, state: FSMContext):
 async def menu_panel(callback: CallbackQuery):
     conn = get_db_connection()
     today = datetime.now(TZ).strftime("%d.%m.%Y")
+    
     jobs_today = conn.execute("SELECT COUNT(*) FROM jobs WHERE date = ?", (today,)).fetchone()[0]
-    profit_today = conn.execute("SELECT SUM(profit) FROM jobs WHERE date = ?", (today,)).fetchone()[0] or 0
+    jobs_profit = conn.execute("SELECT SUM(profit) FROM jobs WHERE date = ?", (today,)).fetchone()[0] or 0
+    expenses_today = conn.execute("SELECT SUM(amount) FROM expenses WHERE date = ?", (today,)).fetchone()[0] or 0
+    income_today = conn.execute("SELECT SUM(amount) FROM income WHERE date = ?", (today,)).fetchone()[0] or 0
+    salaries_today = conn.execute("SELECT SUM(amount) FROM salary_payments WHERE date = ?", (today,)).fetchone()[0] or 0
+    
     conn.close()
     
-    text = f"📊 **Панель управления**\n\nСегодня ({today}):\n🧹 Заявок: {jobs_today}\n💰 Прибыль: {profit_today} руб."
+    net_profit = jobs_profit + income_today - expenses_today
+    
+    text = (
+        f"📊 **Сводка за сегодня ({today}):**\n\n"
+        f"🧹 Заявок выполнено: {jobs_today}\n"
+        f"📈 Прибыль с заявок: {jobs_profit} руб.\n"
+        f"🎁 Доп. доходы: {income_today} руб.\n"
+        f"📉 Расходы: {expenses_today} руб.\n"
+        f"💸 Выплачено ЗП: {salaries_today} руб.\n\n"
+        f"💰 **Чистая прибыль за день: {net_profit} руб.**"
+    )
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=back_to_main_kb())
 
 # --- HANDLERS: JOBS ---
@@ -246,6 +261,41 @@ async def emp_view(callback: CallbackQuery):
         
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=back_to_main_kb())
 
+@router.callback_query(F.data == "emp_stats")
+async def emp_stats_start(callback: CallbackQuery):
+    await callback.message.edit_text("Выберите сотрудника для просмотра статистики:", reply_markup=select_employee_kb("stat_emp_"))
+
+@router.callback_query(F.data.startswith("stat_emp_"))
+async def emp_stats_view(callback: CallbackQuery):
+    emp_id = int(callback.data.split("_")[2])
+    conn = get_db_connection()
+    
+    emp = conn.execute("SELECT * FROM employees WHERE id = ?", (emp_id,)).fetchone()
+    if not emp:
+        await callback.message.edit_text("Сотрудник не найден.", reply_markup=back_to_main_kb())
+        conn.close()
+        return
+        
+    jobs_count = conn.execute("SELECT COUNT(*) FROM jobs WHERE employee_id = ?", (emp_id,)).fetchone()[0]
+    total_earned = conn.execute("SELECT SUM(employee_salary) FROM jobs WHERE employee_id = ?", (emp_id,)).fetchone()[0] or 0
+    total_paid = conn.execute("SELECT SUM(amount) FROM salary_payments WHERE employee_id = ?", (emp_id,)).fetchone()[0] or 0
+    
+    conn.close()
+    
+    balance = total_earned - total_paid
+    
+    text = (
+        f"📈 **Статистика: {emp['name']}**\n"
+        f"Должность: {emp['role']}\n"
+        f"Телефон: {emp['phone']}\n\n"
+        f"🧹 Выполнено заявок: {jobs_count}\n"
+        f"💰 Заработано всего: {total_earned} руб.\n"
+        f"💸 Выплачено всего: {total_paid} руб.\n\n"
+        f"⚖️ **Текущий баланс (долг): {balance} руб.**"
+    )
+    
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=back_to_main_kb())
+
 # --- HANDLERS: EXPENSES ---
 @router.callback_query(F.data == "menu_expenses")
 async def menu_expenses(callback: CallbackQuery):
@@ -329,6 +379,9 @@ async def rep_month(callback: CallbackQuery):
     # Expenses
     expenses = conn.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE ?", (f"%{current_month}",)).fetchone()[0] or 0
     
+    # Salaries
+    salaries = conn.execute("SELECT SUM(amount) FROM salary_payments WHERE date LIKE ?", (f"%{current_month}",)).fetchone()[0] or 0
+    
     conn.close()
     
     total_income = jobs_income + other_income
@@ -338,6 +391,7 @@ async def rep_month(callback: CallbackQuery):
     text += f"📈 Оборот (заявки): {jobs_income} руб.\n"
     text += f"📈 Доп. доходы: {other_income} руб.\n"
     text += f"📉 Расходы: {expenses} руб.\n"
+    text += f"💸 Выплачено ЗП: {salaries} руб.\n"
     text += f"💰 **Чистая прибыль: {net_profit} руб.**"
     
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=back_to_main_kb())
